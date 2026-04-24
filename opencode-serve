@@ -3,7 +3,8 @@
 opencode-serve — portable single-file OpenCode hosting.
 
 Runs opencode on loopback and exposes it via Tailscale Serve (HTTPS, tailnet-only).
-Credentials are stored in the OS keychain. Auto-starts on login via launchd/systemd.
+Credentials are stored in the OS keychain when available. Auto-starts on login
+via launchd/systemd/Task Scheduler.
 
 Usage:
     opencode-serve install [--name NAME] [--reveal]
@@ -69,14 +70,29 @@ def _log_path(name: str) -> Path:
     return _state_dir(name) / "serve.log"
 
 
+def _pid_path(name: str) -> Path:
+    return _state_dir(name) / "serve.pid"
+
+
 def _service_path(name: str) -> Path:
-    if platform.system() == "Darwin":
+    system = platform.system()
+    if system == "Darwin":
         return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_PREFIX}.{name}.plist"
+    if system == "Windows":
+        return _state_dir(name) / f"{PROG}-{name}.cmd"
     return Path.home() / ".config" / "systemd" / "user" / f"{PROG}-{name}.service"
 
 
 def _service_label(name: str) -> str:
     return f"{SERVICE_PREFIX}.{name}"
+
+
+def _service_name(name: str) -> str:
+    if platform.system() == "Windows":
+        return f"{PROG}-{name}"
+    if platform.system() == "Darwin":
+        return _service_label(name)
+    return f"{PROG}-{name}.service"
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +288,44 @@ def _tailscale_serve_off(https_port: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Service (launchd / systemd)
+# Service (launchd / systemd / Task Scheduler)
 # ---------------------------------------------------------------------------
 
 
 def _script_path() -> str:
     return os.path.realpath(sys.argv[0])
+
+
+def _task_command(name: str) -> str:
+    return subprocess.list2cmdline(
+        [
+            sys.executable or "python",
+            _script_path(),
+            "run",
+            "--name",
+            name,
+            "--log-file",
+            str(_log_path(name)),
+        ]
+    )
+
+
+def _run_or_exit(args: list, failure: str) -> subprocess.CompletedProcess:
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode != 0:
+        detail = "\n".join(x for x in (r.stdout.strip(), r.stderr.strip()) if x)
+        sys.exit(f"error: {failure}" + (f":\n{detail}" if detail else ""))
+    return r
+
+
+def _start_windows_task(name: str) -> None:
+    r = subprocess.run(
+        ["schtasks", "/Run", "/TN", _service_name(name)],
+        capture_output=True, text=True,
+    )
+    detail = "\n".join(x for x in (r.stdout.strip(), r.stderr.strip()) if x)
+    if r.returncode != 0 and "already running" not in detail.lower():
+        sys.exit(f"error: failed to start scheduled task" + (f":\n{detail}" if detail else ""))
 
 
 def _write_service(name: str) -> None:
@@ -286,7 +334,11 @@ def _write_service(name: str) -> None:
     path = _service_path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if platform.system() == "Darwin":
+    system = platform.system()
+    if system == "Windows":
+        path.write_text(f"@echo off\r\n{_task_command(name)}\r\n")
+        path.chmod(0o700)
+    elif system == "Darwin":
         path.write_text(
             f'<?xml version="1.0" encoding="UTF-8"?>\n'
             f'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
@@ -322,7 +374,23 @@ def _write_service(name: str) -> None:
 
 
 def _load_service(name: str) -> None:
-    if platform.system() == "Darwin":
+    if platform.system() == "Windows":
+        _run_or_exit(
+            [
+                "schtasks",
+                "/Create",
+                "/TN",
+                _service_name(name),
+                "/SC",
+                "ONLOGON",
+                "/TR",
+                _task_command(name),
+                "/F",
+            ],
+            "failed to create scheduled task",
+        )
+        _start_windows_task(name)
+    elif platform.system() == "Darwin":
         subprocess.run(
             ["launchctl", "load", "-w", str(_service_path(name))],
             check=True,
@@ -336,7 +404,19 @@ def _load_service(name: str) -> None:
 
 
 def _unload_service(name: str) -> None:
-    if platform.system() == "Darwin":
+    if platform.system() == "Windows":
+        was_running = _service_running(name)
+        if was_running:
+            _kill_windows_pid_tree(name)
+        subprocess.run(
+            ["schtasks", "/End", "/TN", _service_name(name)],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["schtasks", "/Delete", "/TN", _service_name(name), "/F"],
+            capture_output=True,
+        )
+    elif platform.system() == "Darwin":
         subprocess.run(
             ["launchctl", "unload", "-w", str(_service_path(name))],
             capture_output=True,
@@ -349,7 +429,28 @@ def _unload_service(name: str) -> None:
 
 
 def _service_action(name: str, action: str) -> None:
-    if platform.system() == "Darwin":
+    if platform.system() == "Windows":
+        if action == "restart":
+            was_running = _service_running(name)
+            if was_running:
+                _kill_windows_pid_tree(name)
+            subprocess.run(
+                ["schtasks", "/End", "/TN", _service_name(name)],
+                capture_output=True,
+            )
+            time.sleep(1)
+            _start_windows_task(name)
+        elif action == "stop":
+            was_running = _service_running(name)
+            if was_running:
+                _kill_windows_pid_tree(name)
+            subprocess.run(
+                ["schtasks", "/End", "/TN", _service_name(name)],
+                capture_output=True,
+            )
+        elif action == "start":
+            _start_windows_task(name)
+    elif platform.system() == "Darwin":
         label = _service_label(name)
         if action == "restart":
             subprocess.run(["launchctl", "stop", label], capture_output=True)
@@ -365,6 +466,17 @@ def _service_action(name: str, action: str) -> None:
 
 
 def _service_running(name: str) -> bool:
+    if platform.system() == "Windows":
+        r = subprocess.run(
+            ["schtasks", "/Query", "/TN", _service_name(name), "/FO", "LIST", "/V"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return False
+        for line in r.stdout.splitlines():
+            if line.lower().startswith("status:"):
+                return line.split(":", 1)[1].strip().lower() == "running"
+        return False
     if platform.system() == "Darwin":
         r = subprocess.run(
             ["launchctl", "list", _service_label(name)],
@@ -377,6 +489,18 @@ def _service_running(name: str) -> bool:
         capture_output=True, text=True,
     )
     return r.stdout.strip() == "active"
+
+
+def _kill_windows_pid_tree(name: str) -> None:
+    if platform.system() != "Windows":
+        return
+    pp = _pid_path(name)
+    if not pp.exists():
+        return
+    pid = pp.read_text().strip()
+    if pid.isdigit():
+        subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True)
+    pp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +553,25 @@ def _health_ok(cfg: dict, password: str, timeout: float = 3.0) -> bool:
 
 def _cmd_install(name: str, reveal: bool) -> None:
     if _config_path(name).exists():
-        sys.exit(f"error: instance '{name}' already exists. Run: {PROG} uninstall {name}")
+        cfg = _load_config(name)
+        print(f"Installing existing '{name}'...")
+        print("  tailscale:    ensuring serve...")
+        _tailscale_serve_on(cfg["port"], cfg["tailscale_https_port"])
+        _state_dir(name).mkdir(parents=True, exist_ok=True)
+        _write_service(name)
+        _load_service(name)
+        print(f"  service:      loaded {_service_name(name)}")
+
+        print()
+        print(f"Installed '{name}'.")
+        print(f"  URL:          {cfg['advertise_url']}")
+        print(f"  Local:        http://127.0.0.1:{cfg['port']}")
+        print(f"  Username:     {cfg['username']}")
+        if reveal:
+            print(f"  Password:     {_keychain_get(name)}")
+        else:
+            print(f"  Password:     (use '{PROG} show-password {name}' to reveal)")
+        return
 
     print(f"Installing '{name}'...")
 
@@ -465,7 +607,7 @@ def _cmd_install(name: str, reveal: bool) -> None:
     _state_dir(name).mkdir(parents=True, exist_ok=True)
     _write_service(name)
     _load_service(name)
-    print(f"  service:      loaded {_service_path(name).name}")
+    print(f"  service:      loaded {_service_name(name)}")
 
     print()
     print(f"Installed '{name}'.")
@@ -531,7 +673,7 @@ def _cmd_status(name: str) -> None:
     print(f"URL:      {cfg['advertise_url']}")
     print(f"Local:    http://127.0.0.1:{cfg['port']}")
     print(f"Status:   {state}")
-    print(f"Service:  {_service_path(name).name}")
+    print(f"Service:  {_service_name(name)}")
     print(f"Log:      {_log_path(name)}")
 
 
@@ -541,7 +683,11 @@ def _cmd_logs(name: str, lines: int) -> None:
     if not lp.exists():
         print(f"No log file at {lp}")
         return
-    subprocess.run(["tail", f"-n{lines}", str(lp)])
+    if lines <= 0:
+        return
+    from collections import deque
+    with lp.open("r", encoding="utf-8", errors="replace") as fh:
+        sys.stdout.write("".join(deque(fh, maxlen=lines)))
 
 
 def _cmd_show_password(name: str) -> None:
@@ -553,13 +699,22 @@ def _cmd_show_password(name: str) -> None:
     print(f"Password: {pw}")
 
 
-def _cmd_run(name: str) -> None:
+def _cmd_run(name: str, log_file: str = "") -> None:
     import signal as _signal
 
     cfg = _load_config(name)
     password = _keychain_get(name)
 
     _state_dir(name).mkdir(parents=True, exist_ok=True)
+    _pid_path(name).write_text(str(os.getpid()) + "\n")
+
+    log_handle = None
+    if log_file:
+        lp = Path(log_file)
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = lp.open("a", encoding="utf-8", buffering=1)
+        sys.stdout = log_handle
+        sys.stderr = log_handle
 
     env = dict(os.environ)
     env["OPENCODE_SERVER_USERNAME"] = cfg["username"]
@@ -572,6 +727,11 @@ def _cmd_run(name: str) -> None:
         "--print-logs",
     ]
     cwd = str(Path.home())
+    shell = (
+        platform.system() == "Windows"
+        and cfg["opencode_binary"].lower().endswith((".bat", ".cmd"))
+    )
+    popen_cmd = subprocess.list2cmdline(cmd) if shell else cmd
 
     proc_holder: list = [None]
 
@@ -583,6 +743,9 @@ def _cmd_run(name: str) -> None:
                 p.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 p.kill()
+        _pid_path(name).unlink(missing_ok=True)
+        if log_handle:
+            log_handle.close()
         sys.exit(0)
 
     _signal.signal(_signal.SIGTERM, _stop)
@@ -596,7 +759,14 @@ def _cmd_run(name: str) -> None:
 
     while True:
         try:
-            proc = subprocess.Popen(cmd, cwd=cwd, env=env)
+            proc = subprocess.Popen(
+                popen_cmd,
+                cwd=cwd,
+                env=env,
+                shell=shell,
+                stdout=log_handle or None,
+                stderr=subprocess.STDOUT if log_handle else None,
+            )
             proc_holder[0] = proc
             code = proc.wait()
             _log(f"opencode exited (code={code}); restarting in {backoff}s")
@@ -644,6 +814,7 @@ def main() -> None:
 
     p = sub.add_parser("run", help=argparse.SUPPRESS)
     p.add_argument("--name", default=DEFAULT_NAME, metavar="NAME")
+    p.add_argument("--log-file", default="", metavar="PATH")
 
     args = ap.parse_args()
 
@@ -656,7 +827,7 @@ def main() -> None:
         "status":        lambda: _cmd_status(args.name),
         "logs":          lambda: _cmd_logs(args.name, args.lines),
         "show-password": lambda: _cmd_show_password(args.name),
-        "run":           lambda: _cmd_run(args.name),
+        "run":           lambda: _cmd_run(args.name, args.log_file),
     }[args.cmd]()
 
 

@@ -9,13 +9,14 @@ The whole project is the executable script plus this README.
 
 - Finds the local `opencode` binary.
 - Starts `opencode serve` on `127.0.0.1` with generated basic-auth credentials.
-- Stores the generated password in the OS keychain.
+- Stores the generated password outside the repo.
 - Creates a Tailscale HTTPS Serve entry that forwards to the loopback server.
 - Installs a user service so the instance starts on login.
 - Supports multiple named instances.
 
 On macOS it uses `launchd` and Keychain. On Linux it uses user `systemd` and
-`secret-tool` when available, with a mode-600 password file fallback.
+`secret-tool` when available, with a mode-600 password file fallback. On Windows
+it uses Task Scheduler and the same mode-600 password file fallback.
 
 ## Requirements
 
@@ -29,6 +30,12 @@ On macOS it uses `launchd` and Keychain. On Linux it uses user `systemd` and
 
 ```sh
 ./opencode-serve install --reveal
+```
+
+On Windows, run the same command through Python:
+
+```powershell
+python .\opencode-serve install --reveal
 ```
 
 This creates the default instance, starts it, and prints the tailnet URL,
@@ -103,6 +110,12 @@ Linux service file:
 
 ```text
 ~/.config/systemd/user/opencode-serve-<name>.service
+```
+
+Windows scheduled task:
+
+```text
+opencode-serve-<name>
 ```
 
 ## Security model
