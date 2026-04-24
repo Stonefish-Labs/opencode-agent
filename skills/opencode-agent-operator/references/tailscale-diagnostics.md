@@ -169,7 +169,7 @@ http://127.0.0.1:<opencode-port>
 6. Confirm credentials:
 
 ```bash
-opencode-agent show-password --reveal <name>
+opencode-agent show-password <name>
 ```
 
 Use this only when the user needs to log in or test manually. Rotate if credentials may have leaked:

@@ -71,7 +71,7 @@ Useful install flags:
 --dry-run
 ```
 
-For lifecycle commands implemented with Go's standard flag parser, put flags before the optional instance name. For example, use `opencode-agent status --json api`, not `opencode-agent status api --json`.
+For lifecycle commands with an optional instance name, flags may be placed before or after the name. For example, both `opencode-agent status --json api` and `opencode-agent status api --json` are valid.
 
 Do not use `--advertise-host` or `--advertise-url` together with `--expose tailscale`; the CLI rejects that combination. Do not use `--advertise-host` and `--advertise-url` together; choose one.
 
@@ -94,10 +94,10 @@ opencode-agent install --workdir /path/to/project --port 4096 --reveal
 Show credentials for an existing instance:
 
 ```bash
-opencode-agent show-password --reveal api
+opencode-agent show-password api
 ```
 
-Without `--reveal`, `show-password` prints the URL and username and confirms that the password is stored in the OS keychain.
+`show-password` prints the URL, username, and password. Use `status` when you only need instance metadata without revealing credentials.
 
 Rotate a password and restart by default:
 

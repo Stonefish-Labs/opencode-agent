@@ -94,7 +94,7 @@ Usage:
   opencode-agent expose status|off [name]
   opencode-agent start|stop|restart [name]
   opencode-agent logs [name] [--lines 120]
-  opencode-agent show-password [name] --reveal
+  opencode-agent show-password [name]
   opencode-agent rotate-password [name] [--reveal]
   opencode-agent uninstall [name] [--purge]
 
@@ -219,7 +219,7 @@ func install(args []string, stdout, stderr io.Writer) error {
 	if *reveal {
 		fmt.Fprintf(stdout, "Password: %s\n", plainPassword)
 	} else {
-		fmt.Fprintln(stdout, "Password: stored in the OS keychain (use `opencode-agent show-password --reveal` to print it).")
+		fmt.Fprintln(stdout, "Password: stored in the OS keychain (use `opencode-agent show-password` to print it).")
 	}
 	printProjectConfigSummary(stdout, projectReport)
 	printExposureSummary(stdout, exposurePlan)
@@ -271,10 +271,11 @@ func status(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	nameFlag := fs.String("name", "", "instance name")
 	jsonOutput := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(args); err != nil {
+	split := splitInterspersedFlags(args, map[string]bool{"name": true})
+	if err := fs.Parse(split.Flags); err != nil {
 		return err
 	}
-	name := pickName(*nameFlag, fs.Args())
+	name := pickName(*nameFlag, split.Positionals)
 	cfg, paths, err := instance.LoadConfig(name)
 	if err != nil {
 		return err
@@ -470,10 +471,11 @@ func serviceAction(args []string, action string, stdout, stderr io.Writer) error
 	fs := flag.NewFlagSet(action, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	nameFlag := fs.String("name", "", "instance name")
-	if err := fs.Parse(args); err != nil {
+	split := splitInterspersedFlags(args, map[string]bool{"name": true})
+	if err := fs.Parse(split.Flags); err != nil {
 		return err
 	}
-	name := pickName(*nameFlag, fs.Args())
+	name := pickName(*nameFlag, split.Positionals)
 	cfg, paths, err := instance.LoadConfig(name)
 	if err != nil {
 		return err
@@ -503,10 +505,14 @@ func logs(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	nameFlag := fs.String("name", "", "instance name")
 	lines := fs.Int("lines", 120, "lines to print")
-	if err := fs.Parse(args); err != nil {
+	split := splitInterspersedFlags(args, map[string]bool{
+		"name":  true,
+		"lines": true,
+	})
+	if err := fs.Parse(split.Flags); err != nil {
 		return err
 	}
-	name := pickName(*nameFlag, fs.Args())
+	name := pickName(*nameFlag, split.Positionals)
 	_, paths, err := instance.LoadConfig(name)
 	if err != nil {
 		return err
@@ -519,11 +525,11 @@ func showPassword(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("show-password", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	nameFlag := fs.String("name", "", "instance name")
-	reveal := fs.Bool("reveal", false, "print the password")
-	if err := fs.Parse(args); err != nil {
+	split := splitInterspersedFlags(args, map[string]bool{"name": true})
+	if err := fs.Parse(split.Flags); err != nil {
 		return err
 	}
-	name := pickName(*nameFlag, fs.Args())
+	name := pickName(*nameFlag, split.Positionals)
 	cfg, _, err := instance.LoadConfig(name)
 	if err != nil {
 		return err
@@ -533,11 +539,7 @@ func showPassword(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "URL: %s\nUsername: %s\n", cfg.AdvertiseURL, creds.Username)
-	if *reveal {
-		fmt.Fprintf(stdout, "Password: %s\n", creds.Password)
-	} else {
-		fmt.Fprintln(stdout, "Password: stored in the OS keychain (rerun with --reveal to print it).")
-	}
+	fmt.Fprintf(stdout, "Password: %s\n", creds.Password)
 	return nil
 }
 
@@ -547,10 +549,11 @@ func rotatePassword(args []string, stdout, stderr io.Writer) error {
 	nameFlag := fs.String("name", "", "instance name")
 	restart := fs.Bool("restart", true, "restart the service after rotating")
 	reveal := fs.Bool("reveal", false, "print the new password")
-	if err := fs.Parse(args); err != nil {
+	split := splitInterspersedFlags(args, map[string]bool{"name": true})
+	if err := fs.Parse(split.Flags); err != nil {
 		return err
 	}
-	name := pickName(*nameFlag, fs.Args())
+	name := pickName(*nameFlag, split.Positionals)
 	cfg, _, err := instance.LoadConfig(name)
 	if err != nil {
 		return err
@@ -588,10 +591,11 @@ func uninstall(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	nameFlag := fs.String("name", "", "instance name")
 	purge := fs.Bool("purge", false, "remove config, state, and keychain password")
-	if err := fs.Parse(args); err != nil {
+	split := splitInterspersedFlags(args, map[string]bool{"name": true})
+	if err := fs.Parse(split.Flags); err != nil {
 		return err
 	}
-	name := pickName(*nameFlag, fs.Args())
+	name := pickName(*nameFlag, split.Positionals)
 	cfg, paths, err := instance.LoadConfig(name)
 	if err != nil {
 		return err
