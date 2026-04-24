@@ -55,6 +55,10 @@ opencode-agent uninstall --purge api
 For Tailscale private access:
 
 ```bash
+# Always verify Serve is enabled on the tailnet before exposing.
+# A hang on `tailscale serve` means it is not enabled yet.
+tailscale serve status   # must return a table, not "Serve is not enabled"
+
 opencode-agent install --workdir /path/to/project --port 4096 --expose tailscale
 opencode-agent expose tailscale api --mode serve
 opencode-agent expose status api

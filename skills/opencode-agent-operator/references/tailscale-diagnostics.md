@@ -27,6 +27,29 @@ tailscale serve status
 tailscale funnel status
 ```
 
+## Pre-Flight: Verify Tailscale Serve/Funnel Is Enabled
+
+**Always run this before attempting any Tailscale Serve or Funnel exposure.** Serve must be explicitly enabled on the tailnet in the admin console; it is not on by default. If it is not enabled, `tailscale serve` will hang waiting for user interaction rather than returning an error.
+
+```bash
+tailscale serve status
+```
+
+If the output contains:
+
+```text
+Serve is not enabled on your tailnet.
+To enable, visit: https://login.tailscale.com/f/serve?node=...
+```
+
+Direct the user to open that URL and enable Serve before continuing. Do not attempt `opencode-agent expose tailscale` or `tailscale serve` until this is confirmed. Similarly for Funnel:
+
+```bash
+tailscale funnel status
+```
+
+Only proceed with exposure once `tailscale serve status` returns a serve table (even an empty one) without the "not enabled" message.
+
 ## How opencode-agent Resolves Tailscale
 
 For Tailscale exposure, the agent runs:
