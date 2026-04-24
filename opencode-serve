@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""
+opencode-serve — portable single-file OpenCode hosting.
+
+Runs opencode on loopback and exposes it via Tailscale Serve (HTTPS, tailnet-only).
+Credentials are stored in the OS keychain. Auto-starts on login via launchd/systemd.
+
+Usage:
+    opencode-serve install [--name NAME] [--reveal]
+    opencode-serve uninstall [--purge] [NAME]
+    opencode-serve start|stop|restart|status [NAME]
+    opencode-serve logs [--lines N] [NAME]
+    opencode-serve show-password [NAME]
+"""
+
+import argparse
+import json
+import os
+import platform
+import random
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PROG = "opencode-serve"
+DEFAULT_NAME = "default"
+KEYCHAIN_ACCOUNT = "opencode-serve"
+SERVICE_PREFIX = "com.opencode.serve"
+USERNAME = "opencode"
+
+SECURE_OPENCODE_JSON = {
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+        "*": "ask",
+        "read": "allow",
+        "grep": "allow",
+        "glob": "allow",
+        "list": "allow",
+        "external_directory": "ask",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+
+def _config_dir() -> Path:
+    return Path.home() / ".config" / PROG
+
+
+def _state_dir(name: str) -> Path:
+    return Path.home() / ".local" / "state" / PROG / name
+
+
+def _config_path(name: str) -> Path:
+    return _config_dir() / f"{name}.json"
+
+
+def _log_path(name: str) -> Path:
+    return _state_dir(name) / "serve.log"
+
+
+def _service_path(name: str) -> Path:
+    if platform.system() == "Darwin":
+        return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_PREFIX}.{name}.plist"
+    return Path.home() / ".config" / "systemd" / "user" / f"{PROG}-{name}.service"
+
+
+def _service_label(name: str) -> str:
+    return f"{SERVICE_PREFIX}.{name}"
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+def _load_config(name: str) -> dict:
+    p = _config_path(name)
+    if not p.exists():
+        sys.exit(f"error: no instance '{name}'. Run: {PROG} install [--name {name}]")
+    return json.loads(p.read_text())
+
+
+def _save_config(name: str, cfg: dict) -> None:
+    _config_dir().mkdir(parents=True, exist_ok=True)
+    p = _config_path(name)
+    p.write_text(json.dumps(cfg, indent=2) + "\n")
+    p.chmod(0o600)
+
+
+# ---------------------------------------------------------------------------
+# Keychain
+# ---------------------------------------------------------------------------
+
+
+def _keychain_service(name: str) -> str:
+    return f"{KEYCHAIN_ACCOUNT}:{name}"
+
+
+def _keychain_store(name: str, password: str) -> None:
+    if platform.system() == "Darwin":
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-a", KEYCHAIN_ACCOUNT, "-s", _keychain_service(name)],
+            capture_output=True,
+        )
+        r = subprocess.run(
+            ["security", "add-generic-password",
+             "-a", KEYCHAIN_ACCOUNT, "-s", _keychain_service(name), "-w", password],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            sys.exit(f"error: failed to store password in keychain: {r.stderr.strip()}")
+    else:
+        st = shutil.which("secret-tool")
+        if st:
+            proc = subprocess.Popen(
+                [st, "store", "--label", _keychain_service(name),
+                 "service", KEYCHAIN_ACCOUNT, "account", name],
+                stdin=subprocess.PIPE,
+            )
+            proc.communicate(input=password.encode())
+            if proc.returncode == 0:
+                return
+        # Fallback: mode-600 file
+        _state_dir(name).mkdir(parents=True, exist_ok=True)
+        pf = _state_dir(name) / ".pw"
+        pf.write_text(password)
+        pf.chmod(0o600)
+
+
+def _keychain_get(name: str) -> str:
+    if platform.system() == "Darwin":
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", KEYCHAIN_ACCOUNT, "-s", _keychain_service(name), "-w"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+    else:
+        st = shutil.which("secret-tool")
+        if st:
+            r = subprocess.run(
+                [st, "lookup", "service", KEYCHAIN_ACCOUNT, "account", name],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        pf = _state_dir(name) / ".pw"
+        if pf.exists():
+            return pf.read_text().strip()
+    sys.exit(f"error: could not retrieve password. Run: {PROG} show-password {name}")
+
+
+def _keychain_delete(name: str) -> None:
+    if platform.system() == "Darwin":
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-a", KEYCHAIN_ACCOUNT, "-s", _keychain_service(name)],
+            capture_output=True,
+        )
+    else:
+        st = shutil.which("secret-tool")
+        if st:
+            subprocess.run(
+                [st, "clear", "service", KEYCHAIN_ACCOUNT, "account", name],
+                capture_output=True,
+            )
+        pf = _state_dir(name) / ".pw"
+        if pf.exists():
+            pf.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _active_tailscale_https_ports() -> set:
+    try:
+        r = subprocess.run(
+            ["tailscale", "serve", "status", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return set()
+        data = json.loads(r.stdout)
+        ports: set = set()
+        for raw in (data.get("TCP") or {}):
+            try:
+                ports.add(int(raw))
+            except ValueError:
+                pass
+        for hp in (data.get("Web") or {}):
+            _, _, p = hp.rpartition(":")
+            try:
+                ports.add(int(p))
+            except ValueError:
+                pass
+        return ports
+    except Exception:
+        return set()
+
+
+def _free_tailscale_https_port() -> int:
+    used = _active_tailscale_https_ports()
+    for _ in range(200):
+        p = random.randint(20000, 49151)
+        if p not in used:
+            return p
+    sys.exit("error: could not find a free Tailscale HTTPS port")
+
+
+# ---------------------------------------------------------------------------
+# Tailscale
+# ---------------------------------------------------------------------------
+
+
+def _tailscale_dns_name() -> str:
+    r = subprocess.run(
+        ["tailscale", "status", "--json"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if r.returncode != 0:
+        sys.exit(f"error: tailscale status failed: {r.stderr.strip()}")
+    data = json.loads(r.stdout)
+    state = data.get("BackendState", "")
+    if state.lower() != "running":
+        sys.exit(f"error: Tailscale is not running (state: {state})")
+    self_node = data.get("Self") or {}
+    dns = self_node.get("DNSName", "").rstrip(".")
+    if not dns:
+        sys.exit(
+            "error: Tailscale DNS name not found.\n"
+            "Enable MagicDNS and HTTPS certificates in your tailnet admin console."
+        )
+    return dns
+
+
+def _tailscale_serve_on(oc_port: int, https_port: int) -> None:
+    r = subprocess.run(
+        ["tailscale", "serve", "--bg", f"--https={https_port}", "--yes",
+         f"http://127.0.0.1:{oc_port}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        sys.exit(f"error: tailscale serve failed:\n{r.stdout}\n{r.stderr}")
+
+
+def _tailscale_serve_off(https_port: int) -> None:
+    subprocess.run(
+        ["tailscale", "serve", f"--https={https_port}", "--yes", "off"],
+        capture_output=True, timeout=15,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Service (launchd / systemd)
+# ---------------------------------------------------------------------------
+
+
+def _script_path() -> str:
+    return os.path.realpath(sys.argv[0])
+
+
+def _write_service(name: str) -> None:
+    lp = _log_path(name)
+    sp = _script_path()
+    path = _service_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if platform.system() == "Darwin":
+        path.write_text(
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+            f' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            f"<plist version=\"1.0\">\n<dict>\n"
+            f"  <key>Label</key>\n  <string>{_service_label(name)}</string>\n"
+            f"  <key>ProgramArguments</key>\n  <array>\n"
+            f"    <string>{sp}</string>\n"
+            f"    <string>run</string>\n"
+            f"    <string>--name</string>\n"
+            f"    <string>{name}</string>\n"
+            f"  </array>\n"
+            f"  <key>RunAtLoad</key>\n  <true/>\n"
+            f"  <key>KeepAlive</key>\n  <true/>\n"
+            f"  <key>StandardOutPath</key>\n  <string>{lp}</string>\n"
+            f"  <key>StandardErrorPath</key>\n  <string>{lp}</string>\n"
+            f"</dict>\n</plist>\n"
+        )
+    else:
+        path.write_text(
+            f"[Unit]\n"
+            f"Description=opencode-serve: {name}\n"
+            f"After=network.target\n\n"
+            f"[Service]\n"
+            f"ExecStart={sp} run --name {name}\n"
+            f"Restart=on-failure\n"
+            f"RestartSec=3\n"
+            f"StandardOutput=append:{lp}\n"
+            f"StandardError=append:{lp}\n\n"
+            f"[Install]\n"
+            f"WantedBy=default.target\n"
+        )
+
+
+def _load_service(name: str) -> None:
+    if platform.system() == "Darwin":
+        subprocess.run(
+            ["launchctl", "load", "-w", str(_service_path(name))],
+            check=True,
+        )
+    else:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", f"{PROG}-{name}.service"],
+            check=True,
+        )
+
+
+def _unload_service(name: str) -> None:
+    if platform.system() == "Darwin":
+        subprocess.run(
+            ["launchctl", "unload", "-w", str(_service_path(name))],
+            capture_output=True,
+        )
+    else:
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", f"{PROG}-{name}.service"],
+            capture_output=True,
+        )
+
+
+def _service_action(name: str, action: str) -> None:
+    if platform.system() == "Darwin":
+        label = _service_label(name)
+        if action == "restart":
+            subprocess.run(["launchctl", "stop", label], capture_output=True)
+            time.sleep(1)
+            subprocess.run(["launchctl", "start", label], check=True)
+        else:
+            subprocess.run(["launchctl", action, label], check=True)
+    else:
+        subprocess.run(
+            ["systemctl", "--user", action, f"{PROG}-{name}.service"],
+            check=True,
+        )
+
+
+def _service_running(name: str) -> bool:
+    if platform.system() == "Darwin":
+        r = subprocess.run(
+            ["launchctl", "list", _service_label(name)],
+            capture_output=True, text=True,
+        )
+        # launchctl list <label> output includes "PID" = <num>; when stopped there is no PID key
+        return r.returncode == 0 and '"PID"' in r.stdout
+    r = subprocess.run(
+        ["systemctl", "--user", "is-active", f"{PROG}-{name}.service"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() == "active"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _find_opencode() -> str:
+    candidates = [Path.home() / ".opencode" / "bin" / "opencode"]
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return str(c)
+    found = shutil.which("opencode")
+    if found:
+        return found
+    sys.exit(
+        "error: opencode binary not found.\n"
+        "Install from https://opencode.ai or ensure it is on your PATH."
+    )
+
+
+def _seed_opencode_config() -> None:
+    p = Path.home() / ".opencode" / "opencode.json"
+    if p.exists():
+        print(f"  opencode.json: existing {p} preserved")
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(SECURE_OPENCODE_JSON, indent=2) + "\n")
+    p.chmod(0o600)
+    print(f"  opencode.json: created secure default at {p}")
+
+
+def _health_ok(cfg: dict, password: str, timeout: float = 3.0) -> bool:
+    import base64
+    import urllib.request
+    url = f"http://127.0.0.1:{cfg['port']}/global/health"
+    creds = base64.b64encode(f"{cfg['username']}:{password}".encode()).decode()
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": f"Basic {creds}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status < 500
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def _cmd_install(name: str, reveal: bool) -> None:
+    if _config_path(name).exists():
+        sys.exit(f"error: instance '{name}' already exists. Run: {PROG} uninstall {name}")
+
+    print(f"Installing '{name}'...")
+
+    binary = _find_opencode()
+    print(f"  binary:       {binary}")
+
+    _seed_opencode_config()
+
+    password = secrets.token_urlsafe(32)
+    _keychain_store(name, password)
+    print("  keychain:     password stored")
+
+    oc_port = _free_loopback_port()
+    https_port = _free_tailscale_https_port()
+    print(f"  ports:        opencode={oc_port}  tailscale-https={https_port}")
+
+    print("  tailscale:    configuring serve...")
+    _tailscale_serve_on(oc_port, https_port)
+    dns = _tailscale_dns_name()
+    url = f"https://{dns}:{https_port}"
+    print(f"  tailscale:    {url}")
+
+    cfg = {
+        "name": name,
+        "opencode_binary": binary,
+        "port": oc_port,
+        "username": USERNAME,
+        "tailscale_https_port": https_port,
+        "advertise_url": url,
+    }
+    _save_config(name, cfg)
+
+    _state_dir(name).mkdir(parents=True, exist_ok=True)
+    _write_service(name)
+    _load_service(name)
+    print(f"  service:      loaded {_service_path(name).name}")
+
+    print()
+    print(f"Installed '{name}'.")
+    print(f"  URL:          {url}")
+    print(f"  Local:        http://127.0.0.1:{oc_port}")
+    print(f"  Username:     {USERNAME}")
+    if reveal:
+        print(f"  Password:     {password}")
+    else:
+        print(f"  Password:     (use '{PROG} show-password {name}' to reveal)")
+
+
+def _cmd_uninstall(name: str, purge: bool) -> None:
+    cfg = _load_config(name)
+    print(f"Uninstalling '{name}'...")
+
+    _unload_service(name)
+    sp = _service_path(name)
+    if sp.exists():
+        sp.unlink()
+    print("  service:      stopped and removed")
+
+    _tailscale_serve_off(cfg["tailscale_https_port"])
+    print("  tailscale:    serve entry removed")
+
+    if purge:
+        _config_path(name).unlink(missing_ok=True)
+        shutil.rmtree(_state_dir(name), ignore_errors=True)
+        _keychain_delete(name)
+        print("  purged:       config, state, and keychain entry removed")
+    else:
+        print(f"  note:         config preserved at {_config_path(name)}")
+        print(f"                use --purge to also remove config, state, and keychain")
+
+    print(f"Uninstalled '{name}'.")
+
+
+def _cmd_start(name: str) -> None:
+    _load_config(name)
+    _service_action(name, "start")
+    print(f"Started '{name}'.")
+
+
+def _cmd_stop(name: str) -> None:
+    _load_config(name)
+    _service_action(name, "stop")
+    print(f"Stopped '{name}'.")
+
+
+def _cmd_restart(name: str) -> None:
+    _load_config(name)
+    _service_action(name, "restart")
+    print(f"Restarted '{name}'.")
+
+
+def _cmd_status(name: str) -> None:
+    cfg = _load_config(name)
+    password = _keychain_get(name)
+    running = _service_running(name)
+    healthy = _health_ok(cfg, password) if running else False
+    state = "running" if healthy else ("starting" if running else "stopped")
+    print(f"Name:     {name}")
+    print(f"URL:      {cfg['advertise_url']}")
+    print(f"Local:    http://127.0.0.1:{cfg['port']}")
+    print(f"Status:   {state}")
+    print(f"Service:  {_service_path(name).name}")
+    print(f"Log:      {_log_path(name)}")
+
+
+def _cmd_logs(name: str, lines: int) -> None:
+    _load_config(name)
+    lp = _log_path(name)
+    if not lp.exists():
+        print(f"No log file at {lp}")
+        return
+    subprocess.run(["tail", f"-n{lines}", str(lp)])
+
+
+def _cmd_show_password(name: str) -> None:
+    cfg = _load_config(name)
+    pw = _keychain_get(name)
+    print(f"URL:      {cfg['advertise_url']}")
+    print(f"Local:    http://127.0.0.1:{cfg['port']}")
+    print(f"Username: {cfg['username']}")
+    print(f"Password: {pw}")
+
+
+def _cmd_run(name: str) -> None:
+    import signal as _signal
+
+    cfg = _load_config(name)
+    password = _keychain_get(name)
+
+    _state_dir(name).mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    env["OPENCODE_SERVER_USERNAME"] = cfg["username"]
+    env["OPENCODE_SERVER_PASSWORD"] = password
+
+    cmd = [
+        cfg["opencode_binary"], "serve",
+        "--hostname", "127.0.0.1",
+        "--port", str(cfg["port"]),
+        "--print-logs",
+    ]
+    cwd = str(Path.home())
+
+    proc_holder: list = [None]
+
+    def _stop(sig, frame):  # noqa: ARG001
+        p = proc_holder[0]
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        sys.exit(0)
+
+    _signal.signal(_signal.SIGTERM, _stop)
+    _signal.signal(_signal.SIGINT, _stop)
+
+    def _log(msg: str) -> None:
+        print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {PROG}[{name}]: {msg}", flush=True)
+
+    backoff = 3
+    _log(f"starting (binary={cfg['opencode_binary']} port={cfg['port']})")
+
+    while True:
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, env=env)
+            proc_holder[0] = proc
+            code = proc.wait()
+            _log(f"opencode exited (code={code}); restarting in {backoff}s")
+        except Exception as exc:
+            _log(f"failed to start opencode: {exc}; retrying in {backoff}s")
+
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog=PROG,
+        description="Portable single-file OpenCode hosting via Tailscale.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND", required=True)
+
+    p = sub.add_parser("install", help="install and start a new instance")
+    p.add_argument("--name", default=DEFAULT_NAME, metavar="NAME")
+    p.add_argument("--reveal", action="store_true", help="print the generated password")
+
+    p = sub.add_parser("uninstall", help="stop and remove an instance")
+    p.add_argument("name", nargs="?", default=DEFAULT_NAME, metavar="NAME")
+    p.add_argument("--purge", action="store_true",
+                   help="also remove config, state, and keychain entry")
+
+    _help = {"start": "start the service", "stop": "stop the service",
+             "restart": "restart the service", "status": "show instance status"}
+    for c in ("start", "stop", "restart", "status"):
+        p = sub.add_parser(c, help=_help[c])
+        p.add_argument("name", nargs="?", default=DEFAULT_NAME, metavar="NAME")
+
+    p = sub.add_parser("logs", help="tail the instance log")
+    p.add_argument("name", nargs="?", default=DEFAULT_NAME, metavar="NAME")
+    p.add_argument("--lines", "-n", type=int, default=100, metavar="N")
+
+    p = sub.add_parser("show-password", help="print URL, username, and password")
+    p.add_argument("name", nargs="?", default=DEFAULT_NAME, metavar="NAME")
+
+    p = sub.add_parser("run", help=argparse.SUPPRESS)
+    p.add_argument("--name", default=DEFAULT_NAME, metavar="NAME")
+
+    args = ap.parse_args()
+
+    {
+        "install":       lambda: _cmd_install(args.name, args.reveal),
+        "uninstall":     lambda: _cmd_uninstall(args.name, args.purge),
+        "start":         lambda: _cmd_start(args.name),
+        "stop":          lambda: _cmd_stop(args.name),
+        "restart":       lambda: _cmd_restart(args.name),
+        "status":        lambda: _cmd_status(args.name),
+        "logs":          lambda: _cmd_logs(args.name, args.lines),
+        "show-password": lambda: _cmd_show_password(args.name),
+        "run":           lambda: _cmd_run(args.name),
+    }[args.cmd]()
+
+
+if __name__ == "__main__":
+    main()
