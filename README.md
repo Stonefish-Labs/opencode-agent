@@ -24,7 +24,39 @@ it uses Task Scheduler and the same mode-600 password file fallback.
 - OpenCode installed and available as `opencode`, or at
   `~/.opencode/bin/opencode`.
 - Tailscale installed, logged in, and running.
+- Tailscale Serve available for the tailnet.
 - Tailscale MagicDNS and HTTPS certificates enabled for the tailnet.
+
+## Tailscale setup
+
+Before installing an instance, make sure the tailnet can issue HTTPS
+certificates for `*.ts.net` machine names:
+
+1. Open the Tailscale admin console.
+2. Go to DNS.
+3. Enable MagicDNS.
+4. Under HTTPS Certificates, enable HTTPS.
+5. Accept the notice that machine names and the tailnet DNS name are published
+   in Certificate Transparency logs.
+
+`opencode-serve` configures Tailscale Serve with an HTTPS listener. If Serve has
+not been enabled or consented for the tailnet yet, the `tailscale serve` command
+may print a Tailscale login or consent URL. Open that URL, approve the change,
+then rerun:
+
+```sh
+./opencode-serve install --reveal
+```
+
+The browser certificate for the printed URL should be issued by Let's Encrypt
+and match the machine DNS name, for example:
+
+```text
+desktopml.tail9749c7.ts.net
+```
+
+If the certificate is for `localhost`, a router, a self-signed issuer, or any
+other hostname, the browser is not seeing the Tailscale Serve HTTPS certificate.
 
 ## Install an instance
 
