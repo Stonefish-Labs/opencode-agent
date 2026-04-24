@@ -36,6 +36,54 @@ func TestCheckHealthSuccessAndFailure(t *testing.T) {
 	}
 }
 
+func TestCheckSkipsCredentialedRemoteHTTP(t *testing.T) {
+	got := CheckWithOptions("http://100.64.1.2:4096", time.Second, CheckOptions{
+		Credentials:             &keychain.Credentials{Username: "u", Password: "p"},
+		AllowCredentials:        true,
+		AllowInsecureRemoteHTTP: false,
+		ExpectedHost:            "100.64.1.2",
+	})
+	if !got.Skipped || got.CredentialsSent {
+		t.Fatalf("expected skipped check without credentials: %#v", got)
+	}
+}
+
+func TestCheckDoesNotFollowRedirectsWithCredentials(t *testing.T) {
+	var sawRedirectAuth bool
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _, sawRedirectAuth = r.BasicAuth()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer redirectTarget.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	got := CheckWithOptions(redirector.URL, time.Second, CheckOptions{
+		Credentials:      &keychain.Credentials{Username: "u", Password: "p"},
+		AllowCredentials: true,
+		ExpectedHost:     "127.0.0.1",
+	})
+	if got.OK || got.StatusCode != http.StatusFound {
+		t.Fatalf("expected redirect response without following: %#v", got)
+	}
+	if sawRedirectAuth {
+		t.Fatalf("credentials were forwarded to redirect target")
+	}
+}
+
+func TestCheckSkipsHostMismatch(t *testing.T) {
+	got := CheckWithOptions("http://127.0.0.1:4096", time.Second, CheckOptions{
+		Credentials:      &keychain.Credentials{Username: "u", Password: "p"},
+		AllowCredentials: true,
+		ExpectedHost:     "example.test",
+	})
+	if !got.Skipped || got.CredentialsSent {
+		t.Fatalf("expected host mismatch skip: %#v", got)
+	}
+}
+
 func TestBuildReportSeparatesLocalAndTailnet(t *testing.T) {
 	t.Setenv("OPENCODE_AGENT_CONFIG_DIR", t.TempDir())
 	t.Setenv("OPENCODE_AGENT_STATE_DIR", t.TempDir())

@@ -159,7 +159,7 @@ func RunCommands(commands []Command) error {
 		if len(command.Args) == 0 {
 			continue
 		}
-		cmd := exec.Command(command.Args[0], command.Args[1:]...)
+		cmd := exec.Command(command.Args[0], command.Args[1:]...) // #nosec G204 -- commands are generated internally from normalized service plans, not shell-expanded user input.
 		var output bytes.Buffer
 		cmd.Stdout = &output
 		cmd.Stderr = &output
@@ -184,15 +184,28 @@ func CopyExecutable(src string) error {
 	if samePath(src, dst) {
 		return nil
 	}
-	data, err := os.ReadFile(src)
+	src, err := trustedExecutableSource(src)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	data, err := os.ReadFile(src) // #nosec G304 -- src is resolved by trustedExecutableSource as an absolute regular executable.
+	if err != nil {
+		return err
+	}
+	if err := ensurePrivateDir(filepath.Dir(dst)); err != nil {
 		return err
 	}
 	tmp := dst + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o755); err != nil {
+	_ = os.Remove(tmp)
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755) // #nosec G302,G304 -- copied executable must be executable; destination is under a private 0700 state directory and O_EXCL avoids symlink overwrite.
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, dst)
@@ -212,7 +225,7 @@ func State(plan Plan) string {
 		}
 		return "not-installed"
 	case "windows":
-		cmd := exec.Command("schtasks", "/Query", "/TN", plan.ServiceName)
+		cmd := exec.Command("schtasks", "/Query", "/TN", plan.ServiceName) // #nosec G204 -- task name is derived from NormalizeName and passed as an argv element.
 		if err := cmd.Run(); err == nil {
 			return "installed"
 		}
@@ -270,6 +283,23 @@ Type=simple
 ExecStart=` + shellCommandLine(args) + `
 Restart=always
 RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=default.target
@@ -327,4 +357,46 @@ func samePath(left, right string) bool {
 		return strings.EqualFold(left, right)
 	}
 	return left == right
+}
+
+func trustedExecutableSource(src string) (string, error) {
+	if src == "" {
+		return "", fmt.Errorf("executable source is empty")
+	}
+	abs, err := filepath.Abs(src)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("executable source %q is not a regular file", resolved)
+	}
+	if runtime.GOOS != "windows" && info.Mode()&0o111 == 0 {
+		return "", fmt.Errorf("executable source %q is not executable", resolved)
+	}
+	return resolved, nil
+}
+
+func ensurePrivateDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", path)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return os.Chmod(path, 0o700) // #nosec G302 -- directories need execute bits; this is owner-only access.
+	}
+	return nil
 }

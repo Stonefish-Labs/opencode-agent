@@ -34,6 +34,13 @@ func TestBuildPlanPerInstanceNames(t *testing.T) {
 			if tt.goos != "windows" && !strings.Contains(plan.UnitContent, "--name") {
 				t.Fatalf("unit should include named run entrypoint: %s", plan.UnitContent)
 			}
+			if tt.goos == "linux" {
+				for _, directive := range []string{"UMask=0077", "NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=full", "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX", "CapabilityBoundingSet=", "AmbientCapabilities="} {
+					if !strings.Contains(plan.UnitContent, directive) {
+						t.Fatalf("linux unit missing %s:\n%s", directive, plan.UnitContent)
+					}
+				}
+			}
 		})
 	}
 }
@@ -64,5 +71,28 @@ func TestStateReportsUnitFilePresence(t *testing.T) {
 	}
 	if got := State(plan); got != "installed" {
 		t.Fatalf("state after unit exists = %q", got)
+	}
+}
+
+func TestCopyExecutableUsesPrivateDestination(t *testing.T) {
+	t.Setenv("OPENCODE_AGENT_CONFIG_DIR", t.TempDir())
+	t.Setenv("OPENCODE_AGENT_STATE_DIR", t.TempDir())
+	src := filepath.Join(t.TempDir(), "opencode-agent")
+	if err := os.WriteFile(src, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := CopyExecutable(src); err != nil {
+		t.Fatalf("CopyExecutable: %v", err)
+	}
+	dst := InstalledExecutablePath()
+	if data, err := os.ReadFile(dst); err != nil || string(data) != "binary" {
+		t.Fatalf("copied executable = %q err=%v", data, err)
+	}
+	info, err := os.Stat(filepath.Dir(dst))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("destination dir mode = %o, want 0700", got)
 	}
 }

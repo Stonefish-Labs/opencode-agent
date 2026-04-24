@@ -2,10 +2,12 @@ package supervisor
 
 import (
 	"context"
+	"encoding/base64"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,11 +16,47 @@ import (
 	"github.com/Stonefish-Labs/opencode-agent/internal/process"
 )
 
-func TestBindCandidatesTailnetFallback(t *testing.T) {
+func TestBindCandidatesTailnetFallbackRequiresOptIn(t *testing.T) {
 	cfg := instance.Config{BindHost: "100.64.1.2"}
 	got := BindCandidates(cfg)
-	if len(got) != 2 || got[0] != "100.64.1.2" || got[1] != "0.0.0.0" {
+	if len(got) != 1 || got[0] != "100.64.1.2" {
 		t.Fatalf("bind candidates = %#v", got)
+	}
+	cfg.AllowAllInterfacesFallback = true
+	got = BindCandidates(cfg)
+	if len(got) != 2 || got[0] != "100.64.1.2" || got[1] != "0.0.0.0" {
+		t.Fatalf("fallback bind candidates = %#v", got)
+	}
+}
+
+func TestBuildEnvironmentFiltersSecretsByDefault(t *testing.T) {
+	cfg := instance.Config{EnvironmentPolicy: "filtered", AllowedEnvironment: []string{"SAFE_ALLOWED"}}
+	got := BuildEnvironment(cfg, keychain.Credentials{Username: "u", Password: "p"}, []string{
+		"PATH=/bin",
+		"HOME=/home/me",
+		"AWS_SECRET_ACCESS_KEY=secret",
+		"SAFE_ALLOWED=x",
+		"HTTP_PROXY=http://proxy",
+		"OPENCODE_SERVER_PASSWORD=parent",
+	})
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{"PATH=/bin", "HOME=/home/me", "SAFE_ALLOWED=x", "HTTP_PROXY=http://proxy", "OPENCODE_SERVER_USERNAME=u", "OPENCODE_SERVER_PASSWORD=p"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("environment missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "AWS_SECRET_ACCESS_KEY") || strings.Contains(joined, "parent") {
+		t.Fatalf("environment leaked secret values:\n%s", joined)
+	}
+}
+
+func TestRedactSanitizesCommonSecretShapes(t *testing.T) {
+	input := "Authorization: Bearer abc123\nhttps://user:pass@example.test\npassword=hunter2\nBasic " + base64.StdEncoding.EncodeToString([]byte("opencode:hunter2"))
+	got := Redact(input, []string{"hunter2", "opencode:hunter2", base64.StdEncoding.EncodeToString([]byte("opencode:hunter2"))})
+	for _, leaked := range []string{"abc123", "user:pass", "hunter2", base64.StdEncoding.EncodeToString([]byte("opencode:hunter2"))} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("redacted output leaked %q:\n%s", leaked, got)
+		}
 	}
 }
 

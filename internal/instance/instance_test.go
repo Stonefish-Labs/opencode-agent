@@ -92,6 +92,39 @@ func TestSaveConfigDoesNotPersistPasswordAndListConfigs(t *testing.T) {
 	}
 }
 
+func TestNormalizeExposureConfig(t *testing.T) {
+	exposure, err := NormalizeExposureConfig(&ExposureConfig{
+		Provider: ExposureProviderTailscale,
+	})
+	if err != nil {
+		t.Fatalf("NormalizeExposureConfig: %v", err)
+	}
+	if exposure.Mode != ExposureModeServe || exposure.HTTPSPort != 443 || exposure.Path != "/" || exposure.Public {
+		t.Fatalf("unexpected serve defaults: %#v", exposure)
+	}
+
+	exposure, err = NormalizeExposureConfig(&ExposureConfig{
+		Provider:  ExposureProviderTailscale,
+		Mode:      ExposureModeFunnel,
+		Public:    true,
+		HTTPSPort: 8443,
+		Path:      "opencode/",
+	})
+	if err != nil {
+		t.Fatalf("NormalizeExposureConfig funnel: %v", err)
+	}
+	if !exposure.Public || exposure.Path != "/opencode" {
+		t.Fatalf("unexpected funnel config: %#v", exposure)
+	}
+
+	if _, err := NormalizeExposureConfig(&ExposureConfig{Provider: ExposureProviderTailscale, Mode: ExposureModeFunnel}); err == nil {
+		t.Fatalf("expected funnel without public confirmation to fail")
+	}
+	if _, err := NormalizeExposureConfig(&ExposureConfig{Provider: ExposureProviderTailscale, Mode: ExposureModeFunnel, Public: true, HTTPSPort: 8080}); err == nil {
+		t.Fatalf("expected invalid funnel port to fail")
+	}
+}
+
 func TestStateRoundTrip(t *testing.T) {
 	resetEnv(t)
 	paths, err := PathsFor("default")
@@ -107,6 +140,29 @@ func TestStateRoundTrip(t *testing.T) {
 	ClearState(paths)
 	if got := LoadState(paths); got.PID != 0 {
 		t.Fatalf("expected cleared state, got %#v", got)
+	}
+}
+
+func TestLogTailReadsRotatedLogs(t *testing.T) {
+	resetEnv(t)
+	paths, err := PathsFor("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.LogPath+".1", []byte("old1\nold2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.LogPath, []byte("new1\nnew2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := LogTail(paths, 3)
+	for _, want := range []string{"old2", "new1", "new2"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("tail missing %q: %q", want, got)
+		}
 	}
 }
 

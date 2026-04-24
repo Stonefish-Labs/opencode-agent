@@ -16,27 +16,47 @@ import (
 )
 
 const (
-	AppName              = "opencode-agent"
-	DefaultName          = "default"
-	DefaultPort          = 4096
-	DefaultUsername      = "opencode"
-	DefaultRestartDelay  = 3
-	DefaultHealthTimeout = 15
+	AppName                  = "opencode-agent"
+	DefaultName              = "default"
+	DefaultPort              = 4096
+	DefaultUsername          = "opencode"
+	DefaultEnvironmentPolicy = "filtered"
+	DefaultRestartDelay      = 3
+	DefaultHealthTimeout     = 15
+	DefaultExposureHTTPSPort = 443
+	DefaultExposurePath      = "/"
+
+	ExposureProviderTailscale = "tailscale"
+	ExposureModeServe         = "serve"
+	ExposureModeFunnel        = "funnel"
 )
 
 var validNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 
 type Config struct {
-	Name               string `json:"name"`
-	OpenCodeBinary     string `json:"opencode_binary"`
-	WorkingDirectory   string `json:"working_directory"`
-	Port               int    `json:"port"`
-	Username           string `json:"username"`
-	BindHost           string `json:"bind_host"`
-	AdvertiseHost      string `json:"advertise_host"`
-	AdvertiseURL       string `json:"advertise_url"`
-	RestartDelaySecond int    `json:"restart_delay_seconds"`
-	HealthTimeoutSec   int    `json:"health_timeout_seconds"`
+	Name                       string          `json:"name"`
+	OpenCodeBinary             string          `json:"opencode_binary"`
+	WorkingDirectory           string          `json:"working_directory"`
+	Port                       int             `json:"port"`
+	Username                   string          `json:"username"`
+	BindHost                   string          `json:"bind_host"`
+	AdvertiseHost              string          `json:"advertise_host"`
+	AdvertiseURL               string          `json:"advertise_url"`
+	AllowInsecureRemoteHTTP    bool            `json:"allow_insecure_remote_http,omitempty"`
+	AllowAllInterfacesFallback bool            `json:"allow_all_interfaces_fallback,omitempty"`
+	EnvironmentPolicy          string          `json:"environment_policy,omitempty"`
+	AllowedEnvironment         []string        `json:"allowed_environment,omitempty"`
+	RestartDelaySecond         int             `json:"restart_delay_seconds"`
+	HealthTimeoutSec           int             `json:"health_timeout_seconds"`
+	Exposure                   *ExposureConfig `json:"exposure,omitempty"`
+}
+
+type ExposureConfig struct {
+	Provider  string `json:"provider"`
+	Mode      string `json:"mode,omitempty"`
+	Public    bool   `json:"public,omitempty"`
+	HTTPSPort int    `json:"https_port,omitempty"`
+	Path      string `json:"path,omitempty"`
 }
 
 type State struct {
@@ -122,6 +142,21 @@ func NormalizeConfig(cfg Config) (Config, error) {
 	if strings.TrimSpace(cfg.BindHost) == "" {
 		cfg.BindHost = cfg.AdvertiseHost
 	}
+	cfg.EnvironmentPolicy = strings.TrimSpace(cfg.EnvironmentPolicy)
+	if cfg.EnvironmentPolicy == "" {
+		cfg.EnvironmentPolicy = DefaultEnvironmentPolicy
+	}
+	switch cfg.EnvironmentPolicy {
+	case "filtered", "minimal", "inherit":
+	default:
+		return Config{}, fmt.Errorf("invalid environment policy %q", cfg.EnvironmentPolicy)
+	}
+	cfg.AllowedEnvironment = normalizeEnvNames(cfg.AllowedEnvironment)
+	exposure, err := NormalizeExposureConfig(cfg.Exposure)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Exposure = exposure
 	if cfg.RestartDelaySecond <= 0 {
 		cfg.RestartDelaySecond = DefaultRestartDelay
 	}
@@ -129,6 +164,48 @@ func NormalizeConfig(cfg Config) (Config, error) {
 		cfg.HealthTimeoutSec = DefaultHealthTimeout
 	}
 	return cfg, nil
+}
+
+func NormalizeExposureConfig(exposure *ExposureConfig) (*ExposureConfig, error) {
+	if exposure == nil {
+		return nil, nil
+	}
+	normalized := *exposure
+	normalized.Provider = strings.ToLower(strings.TrimSpace(normalized.Provider))
+	if normalized.Provider == "" {
+		return nil, nil
+	}
+	if normalized.Provider != ExposureProviderTailscale {
+		return nil, fmt.Errorf("unsupported exposure provider %q", normalized.Provider)
+	}
+	normalized.Mode = strings.ToLower(strings.TrimSpace(normalized.Mode))
+	if normalized.Mode == "" {
+		normalized.Mode = ExposureModeServe
+	}
+	switch normalized.Mode {
+	case ExposureModeServe:
+		normalized.Public = false
+	case ExposureModeFunnel:
+		if !normalized.Public {
+			return nil, errors.New("tailscale funnel exposure requires public=true")
+		}
+	default:
+		return nil, fmt.Errorf("unsupported tailscale exposure mode %q", normalized.Mode)
+	}
+	if normalized.HTTPSPort == 0 {
+		normalized.HTTPSPort = DefaultExposureHTTPSPort
+	}
+	if normalized.HTTPSPort < 1 || normalized.HTTPSPort > 65535 {
+		return nil, errors.New("exposure https port must be between 1 and 65535")
+	}
+	if normalized.Mode == ExposureModeFunnel && normalized.HTTPSPort != 443 && normalized.HTTPSPort != 8443 && normalized.HTTPSPort != 10000 {
+		return nil, errors.New("tailscale funnel https port must be 443, 8443, or 10000")
+	}
+	normalized.Path = normalizeExposurePath(normalized.Path)
+	if strings.ContainsAny(normalized.Path, " \t\r\n?#") {
+		return nil, fmt.Errorf("invalid exposure path %q", normalized.Path)
+	}
+	return &normalized, nil
 }
 
 func LoadConfig(name string) (Config, Paths, error) {
@@ -250,16 +327,35 @@ func StateRoot() string {
 	return filepath.Join(homeDir(), ".local", "state", AppName)
 }
 
-func LogTail(path string, lines int) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
+func LogTail(paths Paths, lines int) string {
+	var combined strings.Builder
+	for _, path := range LogFiles(paths) {
+		data, err := os.ReadFile(path) // #nosec G304 -- log paths are derived from normalized instance Paths, not arbitrary user input.
+		if err != nil {
+			continue
+		}
+		combined.Write(data)
+		if len(data) > 0 && data[len(data)-1] != '\n' {
+			combined.WriteByte('\n')
+		}
 	}
-	parts := strings.Split(string(data), "\n")
+	parts := strings.Split(combined.String(), "\n")
+	if len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
 	if lines > 0 && len(parts) > lines {
 		parts = parts[len(parts)-lines:]
 	}
 	return strings.Join(parts, "\n")
+}
+
+func LogFiles(paths Paths) []string {
+	files := make([]string, 0, 6)
+	for i := 5; i >= 1; i-- {
+		files = append(files, fmt.Sprintf("%s.%d", paths.LogPath, i))
+	}
+	files = append(files, paths.LogPath)
+	return files
 }
 
 func DetectTailscaleIPv4() string {
@@ -285,6 +381,39 @@ func DetectTailscaleIPv4() string {
 func IsTailscaleIPv4(value string) bool {
 	ip := net.ParseIP(strings.TrimSpace(value)).To4()
 	return ip != nil && ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127
+}
+
+func IsLoopbackHost(value string) bool {
+	host := strings.TrimSpace(value)
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func IsAllInterfacesHost(value string) bool {
+	host := strings.TrimSpace(value)
+	return host == "0.0.0.0" || host == "::" || host == "[::]"
+}
+
+func IsLoopbackURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return IsLoopbackHost(parsed.Hostname())
+}
+
+func URLScheme(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme)
 }
 
 func BaseURL(host string, port int) string {
@@ -344,4 +473,32 @@ func executableName() string {
 		return AppName + ".exe"
 	}
 	return AppName
+}
+
+func normalizeEnvNames(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func normalizeExposurePath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return DefaultExposurePath
+	}
+	if !strings.HasPrefix(value, "/") {
+		value = "/" + value
+	}
+	if len(value) > 1 {
+		value = strings.TrimRight(value, "/")
+	}
+	return value
 }

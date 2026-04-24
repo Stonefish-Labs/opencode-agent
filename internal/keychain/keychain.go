@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/zalando/go-keyring"
 )
@@ -13,8 +14,11 @@ import (
 const ServiceName = "opencode-agent"
 
 type Credentials struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Version   int       `json:"version,omitempty"`
+	Username  string    `json:"username"`
+	Password  string    `json:"password"` // #nosec G117 -- marshaled only into the OS keychain blob, never into agent config or logs.
+	CreatedAt time.Time `json:"created_at,omitempty"`
+	RotatedAt time.Time `json:"rotated_at,omitempty"`
 }
 
 var (
@@ -26,6 +30,7 @@ func Store(instance string, creds Credentials) error {
 	if creds.Username == "" || creds.Password == "" {
 		return errors.New("credentials are incomplete")
 	}
+	creds = Normalize(creds, time.Now())
 	blob, err := json.Marshal(creds)
 	if err != nil {
 		return err
@@ -66,7 +71,18 @@ func Load(instance string) (Credentials, error) {
 	if creds.Username == "" || creds.Password == "" {
 		return Credentials{}, errors.New("stored credentials are incomplete")
 	}
+	creds = Normalize(creds, time.Now())
 	return creds, nil
+}
+
+func Normalize(creds Credentials, now time.Time) Credentials {
+	if creds.Version == 0 {
+		creds.Version = 1
+	}
+	if creds.CreatedAt.IsZero() {
+		creds.CreatedAt = now
+	}
+	return creds
 }
 
 func Delete(instance string) {
