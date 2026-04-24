@@ -204,6 +204,26 @@ func RemoveInstalledExecutable() {
 
 func State(plan Plan) string {
 	switch plan.GOOS {
+	case "darwin", "linux":
+		if plan.UnitPath != "" {
+			if _, err := os.Stat(plan.UnitPath); err == nil {
+				return "installed"
+			}
+		}
+		return "not-installed"
+	case "windows":
+		cmd := exec.Command("schtasks", "/Query", "/TN", plan.ServiceName)
+		if err := cmd.Run(); err == nil {
+			return "installed"
+		}
+		return "not-installed"
+	default:
+		return "unknown"
+	}
+}
+
+func PlannedState(plan Plan) string {
+	switch plan.GOOS {
 	case "darwin", "linux", "windows":
 		return "installed"
 	default:

@@ -1,6 +1,8 @@
 package service
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -39,5 +41,26 @@ func TestBuildPlanPerInstanceNames(t *testing.T) {
 func TestBuildPlanRejectsInvalidName(t *testing.T) {
 	if _, err := BuildPlan("linux", "../bad", "/opt/opencode-agent"); err == nil {
 		t.Fatalf("expected invalid name error")
+	}
+}
+
+func TestStateReportsUnitFilePresence(t *testing.T) {
+	t.Setenv("OPENCODE_AGENT_CONFIG_DIR", t.TempDir())
+	t.Setenv("OPENCODE_AGENT_STATE_DIR", t.TempDir())
+	plan, err := BuildPlan("linux", "api", "/opt/opencode-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := State(plan); got != "not-installed" {
+		t.Fatalf("state before unit exists = %q", got)
+	}
+	if err := os.MkdirAll(filepath.Dir(plan.UnitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plan.UnitPath, []byte(plan.UnitContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := State(plan); got != "installed" {
+		t.Fatalf("state after unit exists = %q", got)
 	}
 }
