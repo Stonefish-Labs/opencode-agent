@@ -48,6 +48,39 @@ To create a named instance:
 ./opencode-serve install --name work --reveal
 ```
 
+## Ubuntu home server setup
+
+Ubuntu is supported through per-user `systemd` services. Install the basic
+runtime pieces first:
+
+```sh
+sudo apt install python3 dbus-user-session
+```
+
+For a home server that should start `opencode-serve` after reboot before you
+SSH in, enable lingering for the account that will run OpenCode:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+Then install normally:
+
+```sh
+./opencode-serve install --reveal
+```
+
+On a headless server, `secret-tool` may not have a desktop keyring available.
+In that case, `opencode-serve` falls back to a mode-600 password file under the
+instance state directory:
+
+```text
+~/.local/state/opencode-serve/<name>/.pw
+```
+
+That fallback is expected for a single-user server account. OpenCode still binds
+only to `127.0.0.1`; Tailscale Serve is the remote HTTPS entry point.
+
 ## Common commands
 
 ```sh
