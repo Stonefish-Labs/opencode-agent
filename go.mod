@@ -1,6 +1,6 @@
 module github.com/Stonefish-Labs/opencode-agent
 
-go 1.25.0
+go 1.26.2
 
 require (
 	github.com/zalando/go-keyring v0.2.8

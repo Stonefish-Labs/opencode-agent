@@ -47,10 +47,12 @@ func TestBuildPlanRejectsInvalidName(t *testing.T) {
 func TestStateReportsUnitFilePresence(t *testing.T) {
 	t.Setenv("OPENCODE_AGENT_CONFIG_DIR", t.TempDir())
 	t.Setenv("OPENCODE_AGENT_STATE_DIR", t.TempDir())
-	plan, err := BuildPlan("linux", "api", "/opt/opencode-agent")
+	plan, err := BuildPlan("linux", "statecheck", "/opt/opencode-agent")
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = os.Remove(plan.UnitPath)
+	t.Cleanup(func() { _ = os.Remove(plan.UnitPath) })
 	if got := State(plan); got != "not-installed" {
 		t.Fatalf("state before unit exists = %q", got)
 	}
