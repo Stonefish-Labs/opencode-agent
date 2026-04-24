@@ -10,7 +10,7 @@ Use this skill to operate `opencode-agent` safely. Treat the repository source a
 ## Core Rules
 
 - Prefer loopback installs: keep OpenCode bound to `127.0.0.1` unless the user explicitly accepts broader exposure.
-- Do not print passwords unless the user explicitly asks or a documented workflow requires `--reveal`.
+- Do not print passwords unless the user explicitly asks, uses `show-password`, or a documented workflow requires `--reveal`.
 - Treat remote plain HTTP with Basic Auth as unsafe. Use HTTPS termination through Tailscale Serve/Funnel, Cloudflare Tunnel, Caddy, Nginx, or another identity-aware proxy.
 - Use Tailscale Serve for private tailnet/VPN access. Use Tailscale Funnel only when the user explicitly requests public internet exposure.
 - Use `--dry-run` before risky install or exposure changes when the user wants a preview, or when you need to explain planned files and commands.
@@ -47,7 +47,7 @@ opencode-agent list
 opencode-agent status api
 opencode-agent logs api
 opencode-agent restart api
-opencode-agent show-password --reveal api
+opencode-agent show-password api
 opencode-agent rotate-password --reveal api
 opencode-agent uninstall --purge api
 ```

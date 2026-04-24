@@ -26,7 +26,7 @@ The highest priority remaining risks are:
 | F-002 Tailnet bind fallback | Remediated | Automatic `0.0.0.0` fallback is removed; fallback now requires `--allow-all-interfaces-fallback`. |
 | F-003 Missing secure project config | Remediated | Missing `<workdir>/opencode.json` is seeded with ask-by-default permissions at `0600` unless disabled. |
 | F-004 Unsafe existing project config | Mitigated | Existing configs are preserved and audited with visible warnings for dangerous permissions and MCP definitions. |
-| F-005 Passwords printed to stdout | Remediated | Secrets are hidden by default; reveal requires explicit `--reveal`; dry-run does not generate or print passwords. |
+| F-005 Passwords printed to stdout | Mitigated | Install and rotate hide secrets by default; `show-password` is an explicit credential reveal command; dry-run does not generate or print passwords. |
 | F-006 Password in process environment | Still outstanding | Parent env is filtered, but `OPENCODE_SERVER_PASSWORD` is still required in the child environment. |
 | F-007 Shared Basic Auth only | Still outstanding | Credential metadata and warnings were added, but auth is still one shared credential per instance. |
 | F-008 At-rest logs/metadata | Mitigated | Restrictive permissions remain, log rotation and broader redaction were added; no encryption-at-rest was added. |
@@ -389,15 +389,16 @@ Recommended remediation:
 
 Re-test entry (2026-04-24):
 
-Status: Remediated.
+Status: Mitigated.
 
 Current-state notes:
 
-- `install`, `show-password`, and `rotate-password` hide passwords by default.
-- Password output now requires explicit `--reveal`.
+- `install` and `rotate-password` hide passwords by default.
+- `show-password` prints existing credentials by design; use `status` for instance metadata without revealing credentials.
+- Install and rotation password output requires explicit `--reveal`.
 - `install --dry-run` does not generate a password and prints only placeholder text such as `[generated at install time; not printed during dry-run]`.
-- `TestInstallDryRunShowsNamedPlan` and `TestShowAndRotatePassword` cover the no-reveal default behavior.
-- Remaining risk: explicit `--reveal` still prints the secret by design and should be treated as a deliberate operator action.
+- `TestInstallDryRunShowsNamedPlan` and `TestShowAndRotatePassword` cover dry-run behavior, default rotation hiding, and explicit `show-password` reveal behavior.
+- Remaining risk: `show-password` and explicit `--reveal` on install/rotate print secrets to stdout by design and should be treated as deliberate operator actions.
 
 ### F-006: OpenCode Password Is Passed Through Process Environment
 
@@ -791,13 +792,13 @@ Dangerous project config examples to flag:
 - OS keychain storage is used for credentials.
 - Config, state, service unit, and log files are generally created with restrictive permissions.
 - Password rotation is available and records creation/rotation metadata.
-- Passwords are hidden by default in install, dry-run, show-password, and rotate-password output.
+- Passwords are hidden by default in install, dry-run, and rotate-password output; `show-password` intentionally reveals existing credentials.
 - Child process environment inheritance is filtered by default.
 - Logs rotate and redact common secret shapes in addition to exact password values.
 
 ### Gaps
 
-- Secrets can still be printed to stdout when an operator explicitly passes `--reveal`.
+- Secrets can still be printed to stdout through `show-password` or when an operator explicitly passes `--reveal` to install/rotate.
 - The OpenCode server password is still passed to OpenCode through process environment variables.
 - Rotation has metadata, but no schedule enforcement or per-client revocation model.
 - Logs have broader redaction, but transformed, partial, or context-specific secrets may still evade redaction.
@@ -805,7 +806,7 @@ Dangerous project config examples to flag:
 
 ### Recommendations
 
-- Keep the explicit `--reveal` model and avoid adding secret output to JSON responses.
+- Keep secret output limited to explicit credential workflows and avoid adding secret output to JSON responses.
 - Replace environment-variable password handoff if OpenCode gains a protected secret-file, stdin, or keychain integration.
 - Add credential rotation guidance, age warnings, or an optional rotation policy.
 - Keep the child process environment filtered by default.

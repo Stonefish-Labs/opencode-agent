@@ -159,7 +159,7 @@ opencode-agent list
 opencode-agent status api
 opencode-agent logs api
 opencode-agent restart api
-opencode-agent show-password api --reveal
+opencode-agent show-password api
 opencode-agent rotate-password api --reveal
 opencode-agent uninstall api --purge
 ```
@@ -195,7 +195,7 @@ opencode-agent status api --json
 - `stop [name]`
 - `restart [name]`
 - `logs [name] [--lines 120]`
-- `show-password [name] --reveal`
+- `show-password [name]`
 - `rotate-password [name] [--restart=false] [--reveal]`
 - `uninstall [name] [--purge]`
 

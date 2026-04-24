@@ -40,7 +40,7 @@ Defaults:
 - Password is generated with cryptographic randomness when omitted.
 - Password is stored in the OS keychain service `opencode-agent`, account `instance:<name>`.
 - Password is not written to the agent config.
-- Password is not printed unless `--reveal` is used.
+- Password is not printed during install or rotation unless `--reveal` is used. The explicit `show-password` command prints existing credentials.
 
 Security implications:
 

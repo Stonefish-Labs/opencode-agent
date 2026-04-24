@@ -264,22 +264,37 @@ func TestShowAndRotatePassword(t *testing.T) {
 	if err := keychain.Store("default", keychain.Credentials{Username: "opencode", Password: "old"}); err != nil {
 		t.Fatal(err)
 	}
+	namedCfg := cfg
+	namedCfg.Name = "brain"
+	namedCfg.Port = 4100
+	if _, err := instance.SaveConfig(namedCfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := keychain.Store("brain", keychain.Credentials{Username: "opencode", Password: "brain-secret"}); err != nil {
+		t.Fatal(err)
+	}
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"show-password"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("show-password code=%d stderr=%s", code, stderr.String())
 	}
-	if strings.Contains(stdout.String(), "old") {
-		t.Fatalf("show-password should hide secret without --reveal: %s", stdout.String())
+	if !strings.Contains(stdout.String(), "old") {
+		t.Fatalf("show-password should reveal the secret: %s", stdout.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"show-password", "--reveal"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("show-password --reveal code=%d stderr=%s", code, stderr.String())
+	if code := Run([]string{"show-password", "brain"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("show-password brain code=%d stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "old") {
-		t.Fatalf("show-password --reveal output = %s", stdout.String())
+	if !strings.Contains(stdout.String(), "brain-secret") {
+		t.Fatalf("show-password should reveal the named instance secret: %s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"show-password", "brain", "--reveal"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("show-password should reject the removed --reveal flag: %s", stdout.String())
 	}
 
 	stdout.Reset()
@@ -299,6 +314,15 @@ func TestShowAndRotatePassword(t *testing.T) {
 	}
 	if creds.CreatedAt.IsZero() || creds.RotatedAt.IsZero() {
 		t.Fatalf("credential metadata was not recorded: %#v", creds)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"rotate-password", "brain", "--restart=false", "--reveal"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("rotate-password brain --restart=false --reveal code=%d stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Password: ") || strings.Contains(stdout.String(), "stored in the OS keychain") {
+		t.Fatalf("rotate-password should parse flags after the instance name and reveal when requested: %s", stdout.String())
 	}
 }
 
