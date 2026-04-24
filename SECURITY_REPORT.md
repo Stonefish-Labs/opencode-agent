@@ -1,6 +1,7 @@
 # OpenCode Agent Security Report
 
 Date: 2026-04-24  
+Re-test date: 2026-04-24
 Project: `opencode-agent`  
 Scope: secure design review, threat model, and secure code review of this repository as a trusted service that may be reached by trusted clients over VPN/Tailnet and could be misconfigured onto the open internet.
 
@@ -8,15 +9,30 @@ Scope: secure design review, threat model, and secure code review of this reposi
 
 `opencode-agent` is a compact cross-platform supervisor that installs and runs named OpenCode HTTP servers, stores generated Basic Auth credentials in the OS keychain, and manages per-user service entries. The implementation has several strong foundations: generated passwords use `crypto/rand`, instance names are constrained, config/state/log files are generally written with restrictive permissions, secrets are not persisted in the agent config file, and CI already runs tests, vet, and `govulncheck`.
 
-The main security gap is that the supervised OpenCode server is exposed over plain HTTP and protected only by Basic Auth. A VPN or Tailnet is useful network segmentation, but it is not equivalent to application-layer TLS, client identity, auditability, or fail-closed exposure controls. If the service is exposed beyond loopback, credentials and API traffic can be observed by any entity with access to that network path.
+Re-test on 2026-04-24 found that most original findings have been remediated or substantially mitigated. The supervised OpenCode server still uses HTTP and Basic Auth internally because that is the current upstream server interface, but the agent now binds to loopback by default, refuses non-loopback HTTP advertisement unless explicitly allowed, supports HTTPS advertised URLs, and can configure Tailscale Serve/Funnel as an HTTPS proxy in front of loopback OpenCode.
 
-The highest priority fixes are:
+The highest priority remaining risks are:
 
-1. Require HTTPS/TLS termination for remote access and stop advertising plain HTTP as safe for VPN/Tailnet access.
-2. Remove or make explicit the fallback from Tailnet bind failure to `0.0.0.0`.
-3. Seed safe project-level `opencode.json` defaults when missing, and warn on dangerous existing project configs.
-4. Reduce secrets exposure through stdout and process environment variables.
-5. Add service hardening, stronger audit logging, and CI security checks.
+1. Treat any explicit `--allow-insecure-remote-http` or `--allow-all-interfaces-fallback` deployment as accepted risk requiring local compensating controls.
+2. Replace environment-variable password handoff if upstream OpenCode gains a protected secret-file, stdin, or keychain-based mechanism.
+3. Add per-client identity/revocation through an identity-aware proxy, mTLS, or upstream token support for shared deployments.
+4. Continue treating logs, state, and OpenCode project execution as sensitive because OpenCode remains a command-capable agent running as the user.
+
+## Re-test Summary
+
+| Finding | Current status | Notes |
+| --- | --- | --- |
+| F-001 Plain HTTP with Basic Auth | Mitigated | Remote unsafe HTTP is refused by default, loopback is default, HTTPS advertised URLs and Tailscale HTTPS proxying are supported; internal OpenCode traffic remains HTTP. |
+| F-002 Tailnet bind fallback | Remediated | Automatic `0.0.0.0` fallback is removed; fallback now requires `--allow-all-interfaces-fallback`. |
+| F-003 Missing secure project config | Remediated | Missing `<workdir>/opencode.json` is seeded with ask-by-default permissions at `0600` unless disabled. |
+| F-004 Unsafe existing project config | Mitigated | Existing configs are preserved and audited with visible warnings for dangerous permissions and MCP definitions. |
+| F-005 Passwords printed to stdout | Remediated | Secrets are hidden by default; reveal requires explicit `--reveal`; dry-run does not generate or print passwords. |
+| F-006 Password in process environment | Still outstanding | Parent env is filtered, but `OPENCODE_SERVER_PASSWORD` is still required in the child environment. |
+| F-007 Shared Basic Auth only | Still outstanding | Credential metadata and warnings were added, but auth is still one shared credential per instance. |
+| F-008 At-rest logs/metadata | Mitigated | Restrictive permissions remain, log rotation and broader redaction were added; no encryption-at-rest was added. |
+| F-009 Credentialed health checks | Remediated | Remote checks validate expected host, skip credentialed non-loopback HTTP by default, disable redirects, and bypass proxies. |
+| F-010 systemd hardening | Remediated | Linux user unit now includes multiple sandboxing and privilege-limiting directives with tests. |
+| F-011 Supply-chain controls | Remediated | Actions are SHA-pinned; CI includes gosec, govulncheck, secret scanning, CodeQL, Dependabot, SBOMs, signatures, and attestations. |
 
 ## References
 
@@ -33,7 +49,7 @@ The highest priority fixes are:
 
 Reviewed the repository source, README, service installation logic, CLI flows, process supervision, keychain integration, health checks, CI/release workflows, and hardening reference material.
 
-Validation performed:
+Original validation performed:
 
 - `go test ./...` passed.
 - `go vet ./...` passed.
@@ -41,6 +57,14 @@ Validation performed:
 - `gosec ./...` reported 8 issues, triaged below.
 - No existing `opencode.json` was found in this repository.
 - Hardening content under `/Users/batteryshark/Downloads/opencode-hardening/content` was inspected for secure `opencode.json` defaults.
+
+Re-test validation performed on 2026-04-24:
+
+- `go test ./...` passed.
+- `go vet ./...` passed.
+- `go run golang.org/x/vuln/cmd/govulncheck@latest ./...` reported no vulnerabilities.
+- `go run github.com/securego/gosec/v2/cmd/gosec@v2.23.0 ./...` reported 0 issues.
+- Source and test inspection covered the relevant remediation paths in `internal/cli`, `internal/supervisor`, `internal/projectconfig`, `internal/health`, `internal/service`, `internal/exposure`, `internal/keychain`, `.github/workflows`, and `README.md`.
 
 ## System Overview
 
@@ -161,6 +185,20 @@ Recommended remediation:
 - Consider first-class config fields for external HTTPS URL and internal bind URL so health checks and user-facing URLs do not conflate local HTTP with remote HTTPS.
 - Consider supporting native TLS or mTLS in `opencode-agent` when upstream OpenCode supports it or through a managed sidecar proxy.
 
+Re-test entry (2026-04-24):
+
+Status: Mitigated.
+
+Current-state notes:
+
+- `install` now defaults to `127.0.0.1` for bind and advertised access.
+- Non-loopback `http://` advertised URLs are refused unless `--allow-insecure-remote-http` is explicitly set.
+- `--advertise-url https://...` is supported for externally terminated TLS.
+- `--expose tailscale` keeps OpenCode bound to loopback and advertises an HTTPS Tailscale Serve/Funnel URL.
+- `status`/`list` surface warnings for insecure remote HTTP and shared Basic Auth.
+- README no longer presents VPN/Tailnet plain HTTP as safe remote access.
+- Remaining risk: OpenCode is still started as a plain HTTP Basic Auth server internally, so native TLS/mTLS and per-client identity remain outside this repository unless provided by a proxy/tunnel or future upstream support.
+
 ### F-002: Tailnet Bind Fallback Can Broaden Exposure to `0.0.0.0`
 
 Severity: P0/P1  
@@ -191,6 +229,18 @@ Recommended remediation:
 - Fail closed when the preferred bind address is unavailable.
 - Add install/status warnings for any non-loopback bind.
 - Add firewall guidance and optional preflight checks for non-loopback services.
+
+Re-test entry (2026-04-24):
+
+Status: Remediated.
+
+Current-state notes:
+
+- `supervisor.BindCandidates` only adds `0.0.0.0` when `AllowAllInterfacesFallback` is true and the configured bind host is a Tailscale IPv4 address.
+- `install` exposes the fallback as the explicit `--allow-all-interfaces-fallback` escape hatch.
+- Tailscale-managed exposure binds OpenCode to `127.0.0.1` and proxies through `tailscale serve` or `tailscale funnel`.
+- `health.reportWarnings` warns when all-interface binding or all-interface fallback is configured.
+- `TestBindCandidatesTailnetFallbackRequiresOptIn` covers the fail-closed default.
 
 ### F-003: Missing Secure-by-Default Project `opencode.json`
 
@@ -243,6 +293,18 @@ Recommended remediation:
 - Add a `--no-project-config-seed` escape hatch if needed, but keep secure seeding as the default.
 - Add tests for missing config, existing config, and JSON formatting.
 
+Re-test entry (2026-04-24):
+
+Status: Remediated.
+
+Current-state notes:
+
+- `projectconfig.Prepare` creates `<workdir>/opencode.json` with the recommended ask-by-default policy when missing.
+- The seeded file is created with `0600` permissions and `O_EXCL` so an existing file is not overwritten.
+- `install` calls `projectconfig.Prepare` by default and offers `--no-project-config-seed` as an explicit escape hatch.
+- Dry-run reports that the file would be seeded without writing it.
+- `TestPrepareSeedsMissingConfig`, `TestPrepareDryRunDoesNotWrite`, and install dry-run tests cover this behavior.
+
 ### F-004: Existing Project Config Can Weaken Permissions or Register MCP Servers
 
 Severity: P1  
@@ -280,6 +342,18 @@ Recommended remediation:
   - credentials embedded in MCP headers/env blocks.
 - Offer a separate explicit hardening command to merge safe defaults after backing up the original file.
 
+Re-test entry (2026-04-24):
+
+Status: Mitigated.
+
+Current-state notes:
+
+- Existing `opencode.json`, `opencode.jsonc`, `.opencode/opencode.json`, and `.opencode/opencode.jsonc` files are audited and preserved.
+- The audit warns on `permission: "allow"`, wildcard allow, dangerous tool auto-allows, legacy tool enables, local MCP servers, local MCP commands using network-capable tools, remote MCP URLs without HTTPS, invalid remote MCP URLs, and credential-looking MCP header/environment keys.
+- Install and status output display project-config warnings.
+- `TestPreparePreservesExistingConfig`, `TestAuditWarnsOnDangerousJSONCConfig`, and `TestAuditIncludesDotOpenCodeAndParseWarnings` cover the warning paths.
+- Remaining risk: unsafe project config is warned, not blocked or automatically rewritten. The explicit hardening/merge command proposed in the original remediation has not been implemented.
+
 ### F-005: Passwords Are Printed to Stdout
 
 Severity: P1  
@@ -313,6 +387,18 @@ Recommended remediation:
 - Consider copying to the OS clipboard only with user opt-in and timeout guidance.
 - Avoid showing secrets in JSON output.
 
+Re-test entry (2026-04-24):
+
+Status: Remediated.
+
+Current-state notes:
+
+- `install`, `show-password`, and `rotate-password` hide passwords by default.
+- Password output now requires explicit `--reveal`.
+- `install --dry-run` does not generate a password and prints only placeholder text such as `[generated at install time; not printed during dry-run]`.
+- `TestInstallDryRunShowsNamedPlan` and `TestShowAndRotatePassword` cover the no-reveal default behavior.
+- Remaining risk: explicit `--reveal` still prints the secret by design and should be treated as a deliberate operator action.
+
 ### F-006: OpenCode Password Is Passed Through Process Environment
 
 Severity: P1  
@@ -341,6 +427,17 @@ Recommended remediation:
 - If environment variables remain required by OpenCode, minimize `cmd.Env` to a known allowlist plus required OpenCode variables.
 - Explicitly remove common sensitive variables from the child environment unless required.
 - Document process environment exposure as a known limitation.
+
+Re-test entry (2026-04-24):
+
+Status: Still outstanding.
+
+Current-state notes:
+
+- `supervisor.BuildEnvironment` still injects `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD` into the child environment.
+- The default child environment policy is now `filtered`; common safe variables are passed, parent `OPENCODE_SERVER_*` entries are stripped, and additional variables require `--allow-env` unless the operator explicitly selects `--environment-policy inherit`.
+- `TestBuildEnvironmentFiltersSecretsByDefault` covers removal of common secret-bearing parent environment variables and replacement of parent OpenCode server auth variables.
+- Remaining risk: the Basic Auth password is still present in the child process environment. This is partially mitigated by environment minimization but requires upstream support or a sidecar/proxy design to fully remediate.
 
 ### F-007: Shared Basic Auth Credential Has Limited Identity and Revocation
 
@@ -374,6 +471,18 @@ Recommended remediation:
 - Support multiple named client credentials or tokens if upstream OpenCode allows it.
 - Record authentication mode, credential age, and rotation status in `status`.
 - Add rotation metadata and recommended rotation intervals.
+
+Re-test entry (2026-04-24):
+
+Status: Still outstanding.
+
+Current-state notes:
+
+- The agent still stores one shared Basic Auth username/password per instance.
+- Credential creation and rotation timestamps are now tracked in the keychain blob and shown in status output.
+- `status` always warns that the instance uses shared Basic Auth and recommends an HTTPS identity-aware proxy for per-client identity and rate limits.
+- `rotate-password` remains available and no longer reveals the new password unless `--reveal` is provided.
+- Remaining risk: there are still no per-client tokens, per-client revocation, source allowlists, native rate limits, or auth audit trails in this repository.
 
 ### F-008: At-Rest Metadata and Logs Are Permission-Restricted but Not Encrypted
 
@@ -411,6 +520,18 @@ Recommended remediation:
 - Document that logs are sensitive and should not be attached to issues without review.
 - Consider optional encrypted-at-rest state/log storage only if the operational threat model requires protection from same-user filesystem access.
 
+Re-test entry (2026-04-24):
+
+Status: Mitigated.
+
+Current-state notes:
+
+- Config, state, unit, and log files continue to use restrictive `0600`/`0700` permissions.
+- Agent logs are now rotated with a 10 MiB limit and 5 retained files.
+- Redaction now covers the exact password, `username:password`, base64 Basic Auth pairs, bearer tokens, Authorization/Cookie headers, URL userinfo, common credential-looking key/value pairs, control characters, and very long lines.
+- README documents that logs remain sensitive operational data and should be reviewed before sharing.
+- Remaining risk: state and logs are not encrypted at rest, and exact redaction cannot guarantee removal of every transformed, partial, or context-dependent secret.
+
 ### F-009: Health Checks Can Send Credentials to Configured URLs
 
 Severity: P2  
@@ -442,6 +563,19 @@ Recommended remediation:
 - For remote health checks with credentials, require `https://` unless explicitly allowed.
 - Disable redirects or prevent forwarding credentials across host/scheme changes.
 - Add status warnings when remote health checks are skipped due to unsafe URL scheme.
+
+Re-test entry (2026-04-24):
+
+Status: Remediated.
+
+Current-state notes:
+
+- `health.CheckWithOptions` accepts an expected host and skips the remote check before sending credentials if the health URL host does not match.
+- Credentialed non-loopback HTTP health checks are skipped by default unless `AllowInsecureRemoteHTTP` is explicitly configured.
+- Redirects are disabled with `http.ErrUseLastResponse`, preventing credential forwarding to redirected targets.
+- Proxy use is disabled for health checks by setting `Transport.Proxy` to `nil`.
+- `BuildReport` separates local health from advertised/Tailnet health and passes the expected advertised host.
+- `TestCheckSkipsCredentialedRemoteHTTP`, `TestCheckDoesNotFollowRedirectsWithCredentials`, and `TestCheckSkipsHostMismatch` cover the core credential-safety behavior.
 
 ### F-010: Linux systemd User Unit Lacks Hardening
 
@@ -478,6 +612,16 @@ Recommended remediation:
   - `UMask=077`
 - Document any directives that cannot be enabled due to OpenCode functionality.
 - Add tests that generated units include the chosen directives.
+
+Re-test entry (2026-04-24):
+
+Status: Remediated.
+
+Current-state notes:
+
+- Generated Linux user units now include `UMask=0077`, `NoNewPrivileges=true`, `PrivateTmp=true`, `PrivateDevices=true`, `ProtectSystem=full`, `ProtectControlGroups=true`, `ProtectKernelModules=true`, `ProtectKernelTunables=true`, `ProtectKernelLogs=true`, `ProtectClock=true`, `LockPersonality=true`, `RestrictRealtime=true`, `RestrictSUIDSGID=true`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `SystemCallArchitectures=native`, `CapabilityBoundingSet=`, and `AmbientCapabilities=`.
+- `TestBuildPlanPerInstanceNames` checks that the selected hardening directives are present in generated Linux units.
+- Remaining risk: directives such as `ProtectHome` and stricter filesystem write restrictions are not enabled because OpenCode needs access to the configured working directory and user-level project files.
 
 ### F-011: Supply-Chain Controls Are Good but Incomplete
 
@@ -517,6 +661,19 @@ Recommended remediation:
 - Generate an SBOM for release artifacts.
 - Sign individual artifacts as well as checksum files, or document how consumers should verify artifacts through checksums, signatures, and attestations.
 - Consider SLSA provenance expectations for release consumers.
+
+Re-test entry (2026-04-24):
+
+Status: Remediated.
+
+Current-state notes:
+
+- GitHub Actions in CI, CodeQL, and release workflows are pinned to commit SHAs with version comments.
+- Dependabot is configured for Go modules and GitHub Actions.
+- CI runs tests, vet, `govulncheck`, `gosec`, `gitleaks`, and a cross-build smoke test; Windows also runs tests and a build smoke check.
+- CodeQL is configured for Go with `security-extended` and `security-and-quality` queries on pull requests, pushes, and a weekly schedule.
+- Release builds generate SBOMs with Syft, sign checksums and individual artifacts/SBOMs with cosign, publish provenance attestations, and document verification commands in README.
+- Remaining improvement: pinning the `govulncheck@latest` install in CI to a fixed tool version would make the scanner toolchain more reproducible.
 
 ## HTTPS/TLS Deployment Patterns
 
@@ -633,45 +790,52 @@ Dangerous project config examples to flag:
 - Passwords are not written into `opencode-agent` config files.
 - OS keychain storage is used for credentials.
 - Config, state, service unit, and log files are generally created with restrictive permissions.
-- Password rotation is available.
+- Password rotation is available and records creation/rotation metadata.
+- Passwords are hidden by default in install, dry-run, show-password, and rotate-password output.
+- Child process environment inheritance is filtered by default.
+- Logs rotate and redact common secret shapes in addition to exact password values.
 
 ### Gaps
 
-- Secrets are printed to stdout in several commands.
-- Secrets are passed to OpenCode through process environment variables.
-- Rotation has no metadata, schedule, or per-client revocation model.
-- Logs redact only the exact password string.
-- The keychain entry stores username and password as a JSON blob; this is acceptable for keychain storage but should be documented and covered by tests.
+- Secrets can still be printed to stdout when an operator explicitly passes `--reveal`.
+- The OpenCode server password is still passed to OpenCode through process environment variables.
+- Rotation has metadata, but no schedule enforcement or per-client revocation model.
+- Logs have broader redaction, but transformed, partial, or context-specific secrets may still evade redaction.
+- The keychain entry stores username and password as a JSON blob; this is acceptable for keychain storage and is annotated in code, but should remain covered by tests and documentation.
 
 ### Recommendations
 
-- Reduce reveal-by-default behavior.
-- Add explicit secret reveal flags.
-- Track credential creation/rotation timestamps.
-- Minimize child process environment.
+- Keep the explicit `--reveal` model and avoid adding secret output to JSON responses.
+- Replace environment-variable password handoff if OpenCode gains a protected secret-file, stdin, or keychain integration.
+- Add credential rotation guidance, age warnings, or an optional rotation policy.
+- Keep the child process environment filtered by default.
 - Document incident response steps for leaked server passwords.
-- Add secret scanning to CI and pre-release checks.
+- Keep secret scanning in CI and pre-release checks.
 
 ## Encryption in Transit Review
 
 Current state:
 
 - Internal OpenCode traffic is plain HTTP.
-- Remote advertised URLs are plain HTTP.
-- Authentication is Basic Auth over HTTP unless an external tunnel/proxy is used.
+- Default bind and advertised access are loopback HTTP.
+- Non-loopback HTTP advertised URLs are refused by default unless `--allow-insecure-remote-http` is explicitly set.
+- HTTPS advertised URLs are supported for reverse proxies and tunnels.
+- Tailscale Serve/Funnel exposure keeps OpenCode bound to loopback and advertises HTTPS URLs.
+- Authentication remains Basic Auth between client/proxy and OpenCode unless a proxy adds stronger identity controls.
 
 Required target state:
 
 - Loopback-only HTTP between OpenCode and local proxy is acceptable.
 - Any remote client path must use HTTPS/TLS.
 - Prefer mTLS or identity-aware proxy controls for enterprise/trusted-client use.
-- CLI should distinguish internal bind URL from externally advertised HTTPS URL.
+- Continue distinguishing internal bind URL from externally advertised HTTPS URL in CLI/status output.
 
 ## Encryption at Rest Review
 
 Current state:
 
 - Agent config/state/log files use restrictive filesystem permissions.
+- Agent logs rotate and apply broader secret redaction.
 - Credentials are stored in OS keychain.
 - OpenCode's own provider credentials and session databases are outside this repository's direct control, but the hardening guide notes they may be plaintext protected primarily by permissions.
 
@@ -685,7 +849,7 @@ Required target state:
 
 ## `gosec` Triage
 
-`gosec` reported 8 issues. These should be tracked, but not all are equally exploitable in the current trust model.
+The original `gosec` run reported 8 issues. These were reviewed and remediated or annotated with explicit safety invariants. Re-test on 2026-04-24 with `go run github.com/securego/gosec/v2/cmd/gosec@v2.23.0 ./...` reported 0 issues.
 
 | Rule | Location | CWE | Triage |
 | --- | --- | --- | --- |
@@ -700,55 +864,51 @@ Required target state:
 
 Recommended CI posture:
 
-- Add `gosec` to CI.
-- Suppress or annotate accepted findings only after adding comments/tests that prove the safety invariant.
+- Keep `gosec` in CI.
+- Keep `#nosec` annotations narrow and paired with comments/tests that prove the safety invariant.
 - Keep the report's accepted-risk rationale in the repository.
 
-## Prioritized Remediation Backlog
+## Prioritized Remaining Backlog
 
 ### P0: Required Before Any Open-Internet Exposure
 
 - Do not expose raw OpenCode HTTP directly to the internet.
 - Use HTTPS/TLS termination through Cloudflare Tunnel, Tailscale, Nginx/Caddy, or an enterprise proxy.
-- Remove or explicitly gate `0.0.0.0` bind fallback.
+- Keep `0.0.0.0` bind fallback behind explicit operator opt-in.
 - Require strong proxy-level access control for public tunnel URLs.
 
-### P1: High Priority Refactors
+### P1: Remaining High Priority Refactors
 
-- Seed `<workdir>/opencode.json` with secure defaults when absent.
-- Audit existing project OpenCode configs and warn on dangerous auto-allows or MCP definitions.
-- Stop printing secrets in dry-run; require explicit reveal for secret output.
-- Minimize child process environment and document remaining environment-secret limitation.
-- Add status warnings for non-loopback HTTP advertised URLs.
-- Separate internal bind URL from external advertised HTTPS URL.
+- Replace environment-variable password handoff if upstream OpenCode supports a safer secret transport.
+- Add per-client identity, revocation, and rate limiting through a proxy pattern or future upstream token support.
+- Add a separate explicit hardening command to merge safe project `opencode.json` defaults after backing up the original file.
+- Add credential age warnings or optional rotation policy guidance.
 
 ### P2: Defense in Depth
 
-- Add systemd hardening directives.
-- Add log rotation and broader redaction.
-- Add credential metadata and rotation guidance.
-- Add strict remote health-check URL validation and redirect policy.
-- Add `gosec`, CodeQL, Dependabot, and secret scanning to CI.
-- Generate SBOMs and improve release artifact verification docs.
+- Add warnings when OpenCode auth/config/database files are group/world readable.
+- Add example hardened reverse proxy configs.
+- Add an incident response playbook for leaked server credentials.
+- Pin the CI `govulncheck@latest` install to a fixed scanner version for reproducibility.
+- Consider optional encrypted-at-rest state/log storage only if the operational threat model requires same-user filesystem protection.
 
 ### P3: Operational Maturity
 
 - Add an explicit `security doctor` or `status --security` command.
-- Integrate checks for OpenCode auth/config/database file permissions.
-- Add example hardened reverse proxy configs.
-- Add a documented incident response playbook for leaked server credentials.
 - Add optional JSON output for security posture checks.
 
-## Acceptance Criteria for Future Fixes
+## Acceptance Criteria Re-test Status
 
-- New install into a workdir without `opencode.json` creates the secure default file.
-- Existing `opencode.json` is never overwritten without explicit user action.
-- Existing unsafe config produces visible install/status warnings.
-- Remote access docs never imply plain HTTP is safe solely because VPN/Tailnet is present.
-- Non-loopback HTTP advertised URLs produce warnings.
-- Tailnet bind failure does not silently expose `0.0.0.0`.
-- Tests cover config seeding, existing config preservation, unsafe config warnings, and bind fallback behavior.
-- CI includes vulnerability, static security, dependency, and release integrity checks.
+- Complete: New install into a workdir without `opencode.json` creates the secure default file.
+- Complete: Existing `opencode.json` is never overwritten without explicit user action.
+- Complete: Existing unsafe config produces visible install/status warnings.
+- Complete: Remote access docs no longer imply plain HTTP is safe solely because VPN/Tailnet is present.
+- Complete: Non-loopback HTTP advertised URLs are refused by default and warned about when explicitly allowed.
+- Complete: Tailnet bind failure does not silently expose `0.0.0.0`; all-interface fallback requires explicit opt-in.
+- Complete: Tests cover config seeding, existing config preservation, unsafe config warnings, and bind fallback behavior.
+- Complete: CI includes vulnerability, static security, dependency, release integrity, and secret-scanning checks.
+- Remaining: Fully remove password exposure from the child process environment.
+- Remaining: Add per-client identity/revocation or require it through a first-class proxy integration for shared deployments.
 
 ## Residual Risk
 
