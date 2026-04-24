@@ -3,6 +3,7 @@ package service
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -92,7 +93,7 @@ func TestCopyExecutableUsesPrivateDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0o700 {
+	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o700 {
 		t.Fatalf("destination dir mode = %o, want 0700", got)
 	}
 }
